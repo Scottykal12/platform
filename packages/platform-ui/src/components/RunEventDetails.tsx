@@ -216,16 +216,29 @@ export interface RunEventData extends Record<string, unknown> {
   oldContext?: unknown;
   newContext?: unknown;
   summary?: string;
+  contextDelta?: {
+    status?: ContextDeltaStatus;
+  };
+  contextDeltaStatus?: ContextDeltaStatus;
 }
 
 export type EventType = 'message' | 'llm' | 'tool' | 'summarization';
 export type ToolSubtype = 'generic' | 'shell' | 'manage' | string;
 export type MessageSubtype = 'source' | 'intermediate' | 'result';
 export type OutputViewMode = 'text' | 'terminal' | 'markdown' | 'json' | 'yaml';
+export type ContextDeltaStatus = 'available' | 'empty' | 'unavailable' | 'redacted' | 'first_call' | 'unknown';
+
+export type ContextPaginationState = {
+  hasMore: boolean;
+  isLoading: boolean;
+  error: string | null;
+};
 
 export interface RunEventDetailsProps {
   event: RunEvent;
   runId?: string;
+  contextPagination?: ContextPaginationState;
+  onLoadOlderContext?: (eventId: string) => Promise<{ addedCount: number; hasMore: boolean }>;
 }
 
 export interface RunEvent {
@@ -237,15 +250,18 @@ export interface RunEvent {
   data: RunEventData;
 }
 
-export function RunEventDetails({ event, runId }: RunEventDetailsProps) {
+export function RunEventDetails({ event, runId, contextPagination, onLoadOlderContext }: RunEventDetailsProps) {
   const [outputViewMode, setOutputViewMode] = useState<OutputViewMode>('text');
   const [expandedToolCalls, setExpandedToolCalls] = useState<Set<string>>(new Set());
   const [contextOlderVisibleCount, setContextOlderVisibleCount] = useState(0);
   const [contextOlderLoading, setContextOlderLoading] = useState(false);
   const [contextOlderError, setContextOlderError] = useState<string | null>(null);
-  const loadMoreResetTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [contextHistoryNotice, setContextHistoryNotice] = useState<string | null>(null);
   const contextScrollRef = useRef<HTMLDivElement | null>(null);
   const pendingScrollAnchor = useRef<{ previousHeight: number; previousScrollTop: number } | null>(null);
+  const pendingContextLoadRef = useRef(false);
+  const contextPaginationLoading = contextPagination?.isLoading ?? false;
+  const contextPaginationHasMore = contextPagination?.hasMore ?? false;
 
   const contextRecordsOrdered = useMemo(() => {
     if (event.type !== 'llm') return [] as Record<string, unknown>[];
@@ -291,11 +307,9 @@ export function RunEventDetails({ event, runId }: RunEventDetailsProps) {
     setContextOlderVisibleCount(0);
     setContextOlderLoading(false);
     setContextOlderError(null);
-    if (loadMoreResetTimeout.current !== null) {
-      clearTimeout(loadMoreResetTimeout.current);
-      loadMoreResetTimeout.current = null;
-    }
+    setContextHistoryNotice(null);
     pendingScrollAnchor.current = null;
+    pendingContextLoadRef.current = false;
   }, [event.id]);
 
   useEffect(() => {
@@ -303,19 +317,14 @@ export function RunEventDetails({ event, runId }: RunEventDetailsProps) {
   }, [olderContextEntries.length]);
 
   useEffect(() => {
-    return () => {
-      if (loadMoreResetTimeout.current !== null) {
-        clearTimeout(loadMoreResetTimeout.current);
-      }
-    };
-  }, []);
+    if (!contextPagination?.error) return;
+    setContextOlderError('Failed to load older context.');
+    setContextOlderLoading(false);
+    pendingContextLoadRef.current = false;
+  }, [contextPagination?.error]);
 
-  const handleLoadMoreContext = useCallback(() => {
-    if (contextOlderLoading) return;
-    if (olderContextEntries.length === 0) {
-      setContextOlderError('Failed to load older context.');
-      return;
-    }
+  const handleLoadMoreContext = useCallback(async () => {
+    if (contextOlderLoading || contextPaginationLoading) return;
     const container = contextScrollRef.current;
     if (container) {
       pendingScrollAnchor.current = {
@@ -327,32 +336,59 @@ export function RunEventDetails({ event, runId }: RunEventDetailsProps) {
     }
     setContextOlderLoading(true);
     setContextOlderError(null);
-    try {
-      const nextCount = Math.min(contextOlderVisibleCount + CONTEXT_PAGINATION_PAGE_SIZE, olderContextEntries.length);
-      if (nextCount <= contextOlderVisibleCount) {
-        throw new Error('No additional context available');
-      }
+    setContextHistoryNotice(null);
+
+    const nextCount = Math.min(contextOlderVisibleCount + CONTEXT_PAGINATION_PAGE_SIZE, olderContextEntries.length);
+    if (nextCount > contextOlderVisibleCount) {
       setContextOlderVisibleCount(nextCount);
-      if (loadMoreResetTimeout.current !== null) {
-        clearTimeout(loadMoreResetTimeout.current);
-      }
-      loadMoreResetTimeout.current = setTimeout(() => {
-        setContextOlderLoading(false);
-        loadMoreResetTimeout.current = null;
-      }, 0);
+      setContextOlderLoading(false);
+      return;
+    }
+
+    if (!onLoadOlderContext || !contextPaginationHasMore) {
+      setContextHistoryNotice('No context history available for this call.');
+      setContextOlderLoading(false);
+      pendingScrollAnchor.current = null;
+      return;
+    }
+
+    try {
+      pendingContextLoadRef.current = true;
+      await onLoadOlderContext(event.id);
     } catch (error) {
       console.error('Failed to load older context', error);
       setContextOlderError('Failed to load older context.');
+      pendingContextLoadRef.current = false;
+      setContextOlderLoading(false);
       pendingScrollAnchor.current = null;
-      if (loadMoreResetTimeout.current !== null) {
-        clearTimeout(loadMoreResetTimeout.current);
-      }
-      loadMoreResetTimeout.current = setTimeout(() => {
-        setContextOlderLoading(false);
-        loadMoreResetTimeout.current = null;
-      }, 0);
     }
-  }, [contextOlderLoading, olderContextEntries.length, contextOlderVisibleCount]);
+  }, [
+    contextOlderLoading,
+    contextPaginationLoading,
+    contextOlderVisibleCount,
+    olderContextEntries.length,
+    onLoadOlderContext,
+    contextPaginationHasMore,
+    event.id,
+  ]);
+
+  useEffect(() => {
+    if (!pendingContextLoadRef.current) return;
+    if (contextPaginationLoading) return;
+    const nextCount = Math.min(contextOlderVisibleCount + CONTEXT_PAGINATION_PAGE_SIZE, olderContextEntries.length);
+    if (nextCount > contextOlderVisibleCount) {
+      setContextOlderVisibleCount(nextCount);
+    } else if (!contextPaginationHasMore) {
+      setContextHistoryNotice('No context history available for this call.');
+    }
+    setContextOlderLoading(false);
+    pendingContextLoadRef.current = false;
+  }, [
+    contextOlderVisibleCount,
+    olderContextEntries.length,
+    contextPaginationLoading,
+    contextPaginationHasMore,
+  ]);
 
   useLayoutEffect(() => {
     const container = contextScrollRef.current;
@@ -375,10 +411,26 @@ export function RunEventDetails({ event, runId }: RunEventDetailsProps) {
   }, [visibleContextRecords]);
 
   const handleRetryLoadMore = useCallback(() => {
-    if (contextOlderLoading) return;
+    if (contextOlderLoading || contextPaginationLoading) return;
     setContextOlderError(null);
     handleLoadMoreContext();
-  }, [contextOlderLoading, handleLoadMoreContext]);
+  }, [contextOlderLoading, contextPaginationLoading, handleLoadMoreContext]);
+
+  const handleViewContextHistory = useCallback(() => {
+    if (contextOlderLoading || contextPaginationLoading) return;
+    setContextHistoryNotice(null);
+    if (olderContextEntries.length === 0 && !contextPaginationHasMore) {
+      setContextHistoryNotice('No context history available for this call.');
+      return;
+    }
+    handleLoadMoreContext();
+  }, [
+    contextOlderLoading,
+    contextPaginationLoading,
+    olderContextEntries.length,
+    contextPaginationHasMore,
+    handleLoadMoreContext,
+  ]);
 
   const isShellToolEvent =
     event.type === 'tool' &&
@@ -524,8 +576,16 @@ export function RunEventDetails({ event, runId }: RunEventDetailsProps) {
     const toolCalls = Array.isArray(event.data.toolCalls)
       ? event.data.toolCalls.filter(isRecord)
       : [];
+    const contextDeltaStatus = event.data.contextDelta?.status ?? event.data.contextDeltaStatus ?? 'unknown';
+    const emptyContextMessage = contextDeltaStatus === 'empty'
+      ? 'No new context added for this call.'
+      : contextDeltaStatus === 'first_call'
+        ? 'This is the first call in the run.'
+        : 'Context delta is not available for this call.';
     const showEmptyContext = context.length === 0;
-    const showLoadMoreButton = hasOlderContextRemaining && !contextOlderError;
+    const contextLoadInProgress = contextOlderLoading || contextPaginationLoading;
+    const showHistoryButton = !contextOlderError && (contextOlderVisibleCount === 0 || hasOlderContextRemaining || contextPaginationHasMore);
+    const historyButtonLabel = contextOlderVisibleCount > 0 ? 'Load more' : 'View context history';
 
     return (
       <div className="space-y-6 h-full flex flex-col">
@@ -588,22 +648,25 @@ export function RunEventDetails({ event, runId }: RunEventDetailsProps) {
                 ref={contextScrollRef}
                 data-testid="context-scroll-container"
               >
-                {showLoadMoreButton && (
+                {showHistoryButton && (
                   <button
                     type="button"
-                    onClick={handleLoadMoreContext}
-                    disabled={contextOlderLoading}
+                    onClick={handleViewContextHistory}
+                    disabled={contextLoadInProgress}
                     className="mb-4 w-full text-sm text-[var(--agyn-blue)] hover:text-[var(--agyn-blue)]/80 py-2 border border-[var(--agyn-border-subtle)] rounded-[6px] transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
                   >
-                    {contextOlderLoading ? 'Loading…' : 'Load more'}
+                    {contextLoadInProgress ? 'Loading…' : historyButtonLabel}
                   </button>
                 )}
                 {showEmptyContext ? (
-                  <div className="text-sm text-[var(--agyn-gray)]">No new context for this call.</div>
+                  <div className="text-sm text-[var(--agyn-gray)]">{emptyContextMessage}</div>
                 ) : (
                   <div className="flex flex-col">
                     {renderContextMessages(context)}
                   </div>
+                )}
+                {contextHistoryNotice && (
+                  <div className="mt-3 text-sm text-[var(--agyn-gray)]">{contextHistoryNotice}</div>
                 )}
                 {contextOlderError && (
                   <div className="mt-4 border border-[var(--agyn-border-subtle)] rounded-[6px] p-3 bg-[var(--agyn-bg-light)]">

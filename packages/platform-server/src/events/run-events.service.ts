@@ -73,6 +73,23 @@ export type SerializedContextItem = {
   createdAt: string;
 };
 
+export type LlmContextPageCursor = {
+  idx: number;
+  rowId: string;
+};
+
+export type LlmContextPageItem = {
+  rowId: string;
+  idx: number;
+  isNew: boolean;
+  contextItem: SerializedContextItem;
+};
+
+export type LlmContextPage = {
+  items: LlmContextPageItem[];
+  nextCursor: LlmContextPageCursor | null;
+};
+
 type LLMInputContextRole =
   | 'system'
   | 'user'
@@ -135,6 +152,14 @@ const RUN_EVENT_STATUSES: ReadonlyArray<RunEventStatus> = [
   RunEventStatus.cancelled,
 ] as const;
 
+export type LlmContextDeltaStatus =
+  | 'available'
+  | 'empty'
+  | 'unavailable'
+  | 'redacted'
+  | 'first_call'
+  | 'unknown';
+
 export type RunTimelineEvent = {
   id: string;
   runId: string;
@@ -158,6 +183,7 @@ export type RunTimelineEvent = {
     topP: number | null;
     stopReason: string | null;
     inputContextItems: LLMInputContextItem[];
+    contextDeltaStatus: LlmContextDeltaStatus;
     responseText: string | null;
     rawResponse: unknown;
     toolCalls: Array<{ callId: string; name: string; arguments: unknown }>;
@@ -725,6 +751,11 @@ export class RunEventsService {
         isNew: Boolean(row.isNew),
       }));
     const linkedToolExecutionIds = event.llmCall?.toolExecutions?.map((exec) => exec.eventId) ?? [];
+    const contextDeltaStatus: LlmContextDeltaStatus = inputContextItems.length === 0
+      ? 'unavailable'
+      : inputContextItems.some((row) => row.isNew)
+        ? 'available'
+        : 'empty';
     const llmCall = event.llmCall
       ? {
           provider: event.llmCall.provider ?? null,
@@ -733,6 +764,7 @@ export class RunEventsService {
           topP: event.llmCall.topP ?? null,
           stopReason: event.llmCall.stopReason ?? null,
           inputContextItems,
+          contextDeltaStatus,
           responseText: event.llmCall.responseText ?? null,
           rawResponse: this.toPlainJson(event.llmCall.rawResponse ?? null),
           toolCalls: event.llmCall.toolCalls.map((tc) => ({
@@ -1247,6 +1279,87 @@ export class RunEventsService {
       if (found) ordered.push(found);
     }
     return ordered;
+  }
+
+  async listLlmContextItems(params: {
+    runId: string;
+    eventId: string;
+    limit?: number;
+    cursor?: LlmContextPageCursor;
+  }): Promise<LlmContextPage | null> {
+    const event = await this.prisma.runEvent.findFirst({
+      where: {
+        id: params.eventId,
+        runId: params.runId,
+        type: RunEventType.llm_call,
+      },
+      select: { id: true },
+    });
+
+    if (!event) return null;
+
+    const where: Prisma.LLMCallContextItemWhereInput = {
+      llmCallEventId: params.eventId,
+      direction: LLMCallContextItemDirection.input,
+    };
+
+    if (params.cursor) {
+      where.OR = [
+        { idx: { lt: params.cursor.idx } },
+        {
+          AND: [
+            { idx: { equals: params.cursor.idx } },
+            { id: { lt: params.cursor.rowId } },
+          ],
+        },
+      ];
+    }
+
+    const pageLimit = params.limit ?? 50;
+    const rows = await this.prisma.lLMCallContextItem.findMany({
+      where,
+      orderBy: [{ idx: 'desc' }, { id: 'desc' }],
+      take: pageLimit + 1,
+      select: {
+        id: true,
+        idx: true,
+        isNew: true,
+        contextItem: {
+          select: {
+            id: true,
+            role: true,
+            contentText: true,
+            contentJson: true,
+            metadata: true,
+            sizeBytes: true,
+            createdAt: true,
+          },
+        },
+      },
+    });
+
+    const slice = rows.slice(0, pageLimit);
+    const items: LlmContextPageItem[] = slice.map((row) => ({
+      rowId: row.id,
+      idx: row.idx,
+      isNew: row.isNew,
+      contextItem: this.serializeContextItem(row.contextItem),
+    }));
+
+    if (items.length === 0) {
+      return { items: [], nextCursor: null };
+    }
+
+    const hasNext = rows.length > pageLimit;
+    const last = items[items.length - 1];
+    const nextCursor = hasNext
+      ? {
+          idx: last.idx,
+          rowId: last.rowId,
+        }
+      : null;
+
+    return { items, nextCursor };
   }
 
   private async createEvent(

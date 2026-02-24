@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { AgentsRunScreen } from '../AgentsRunScreen';
 import type {
   ContextItem,
+  LlmContextPage,
   RunEventStatus,
   RunEventType,
   RunTimelineEvent,
@@ -60,19 +61,13 @@ vi.mock('@/api/hooks/runs', () => ({
 const runsModuleMocks = vi.hoisted(() => ({
   terminate: vi.fn(),
   timelineEvents: vi.fn(),
+  llmContext: vi.fn<Promise<LlmContextPage>, [string, string, { cursor?: { idx: number; rowId: string } | null; limit?: number }]>(),
 }));
 
 vi.mock('@/api/modules/runs', () => ({
   runs: runsModuleMocks,
 }));
 
-const contextItemsMocks = vi.hoisted(() => ({
-  getMany: vi.fn(async () => [] as never[]),
-}));
-
-vi.mock('@/api/modules/contextItems', () => ({
-  contextItems: contextItemsMocks,
-}));
 
 const notifyMocks = vi.hoisted(() => ({
   success: vi.fn(),
@@ -130,8 +125,8 @@ beforeEach(() => {
   runsHookMocks.events.mockReset();
   runsHookMocks.totals.mockReset();
   runsHookMocks.totals.mockReturnValue(buildTotalsResponse());
-  contextItemsMocks.getMany.mockReset();
-  contextItemsMocks.getMany.mockResolvedValue([]);
+  runsModuleMocks.llmContext.mockReset();
+  runsModuleMocks.llmContext.mockResolvedValue({ items: [], nextCursor: null });
 });
 
 afterEach(() => {
@@ -239,6 +234,25 @@ function buildContextItems(rows: ContextRowInput[], prefix = 'rel'): LlmCallCont
     order: row.order ?? idx,
     createdAt: row.createdAt,
   }));
+}
+
+type ContextPageRowInput = {
+  contextItem: ContextItem;
+  isNew?: boolean;
+  idx?: number;
+  rowId?: string;
+};
+
+function buildLlmContextPage(items: ContextPageRowInput[], nextCursor: LlmContextPage['nextCursor'] = null): LlmContextPage {
+  return {
+    items: items.map((item, index) => ({
+      rowId: item.rowId ?? `row-${index + 1}`,
+      idx: item.idx ?? index,
+      isNew: item.isNew ?? false,
+      contextItem: item.contextItem,
+    })),
+    nextCursor,
+  };
 }
 
 type AgentsRunScreenWithTesting = typeof AgentsRunScreen & {
@@ -352,7 +366,7 @@ describe('AgentsRunScreen', () => {
 
     render(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}`]}>
+        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}?eventId=${event.id}`]}>
           <Routes>
             <Route path="/threads/:threadId/runs/:runId" element={<AgentsRunScreen />} />
           </Routes>
@@ -388,7 +402,7 @@ describe('AgentsRunScreen', () => {
 
     render(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}`]}>
+        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}?eventId=${event.id}`]}>
           <Routes>
             <Route path="/threads/:threadId/runs/:runId" element={<AgentsRunScreen />} />
           </Routes>
@@ -427,7 +441,7 @@ describe('AgentsRunScreen', () => {
 
     render(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}`]}>
+        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}?eventId=${event.id}`]}>
           <Routes>
             <Route path="/threads/:threadId/runs/:runId" element={<AgentsRunScreen />} />
           </Routes>
@@ -466,7 +480,7 @@ describe('AgentsRunScreen', () => {
 
     render(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}`]}>
+        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}?eventId=${event.id}`]}>
           <Routes>
             <Route path="/threads/:threadId/runs/:runId" element={<AgentsRunScreen />} />
           </Routes>
@@ -506,7 +520,7 @@ describe('AgentsRunScreen', () => {
 
     render(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}`]}>
+        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}?eventId=${event.id}`]}>
           <Routes>
             <Route path="/threads/:threadId/runs/:runId" element={<AgentsRunScreen />} />
           </Routes>
@@ -580,6 +594,7 @@ describe('AgentsRunScreen', () => {
           ],
           'ctx-anthropic-tool-call',
         ),
+        contextDeltaStatus: 'empty',
         responseText: 'Done with delegate message.',
         rawResponse: null,
         toolCalls: [],
@@ -608,13 +623,13 @@ describe('AgentsRunScreen', () => {
       totalEvents: 1,
     });
     runsHookMocks.events.mockReturnValue({ items: [event], nextCursor: null });
-    contextItemsMocks.getMany.mockResolvedValue([anthropicAssistant]);
+    runsModuleMocks.llmContext.mockResolvedValue(buildLlmContextPage([{ contextItem: anthropicAssistant }]));
 
     const queryClient = new QueryClient();
 
     render(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}`]}>
+        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}?eventId=${event.id}`]}>
           <Routes>
             <Route path="/threads/:threadId/runs/:runId" element={<AgentsRunScreen />} />
           </Routes>
@@ -622,11 +637,22 @@ describe('AgentsRunScreen', () => {
       </QueryClientProvider>,
     );
 
-    await waitFor(() => expect(contextItemsMocks.getMany).toHaveBeenCalledWith([anthropicAssistant.id]));
-    await waitFor(() => expect(runScreenMocks.props).toHaveBeenCalled());
-
-    const capturedProps = runScreenMocks.props.mock.calls.at(-1)?.[0] as { events: Array<{ data: Record<string, unknown> }> } | undefined;
-    if (!capturedProps) throw new Error('RunScreen props were not captured.');
+    await waitFor(() =>
+      expect(runsModuleMocks.llmContext).toHaveBeenCalledWith(
+        event.runId,
+        event.id,
+        expect.objectContaining({ limit: 100 }),
+      ),
+    );
+    const capturedProps = await waitFor(() => {
+      const lastCall = runScreenMocks.props.mock.calls.at(-1)?.[0] as { events: Array<{ data: Record<string, unknown> }> } | undefined;
+      if (!lastCall) throw new Error('RunScreen props were not captured.');
+      const [capturedEvent] = lastCall.events;
+      const context = (capturedEvent.data.context as Record<string, unknown>[] | undefined) ?? [];
+      const assistantRecord = context.find((entry) => entry.role === 'assistant');
+      if (!assistantRecord) throw new Error('Context not loaded yet.');
+      return lastCall;
+    });
 
     const [capturedEvent] = capturedProps.events;
     const context = (capturedEvent.data.context as Record<string, unknown>[] | undefined) ?? [];
@@ -741,6 +767,7 @@ describe('AgentsRunScreen', () => {
           ],
           'ctx-llm-separated',
         ),
+        contextDeltaStatus: 'empty',
         responseText: 'I am fine, thanks!',
         rawResponse: null,
         toolCalls: [
@@ -774,13 +801,13 @@ describe('AgentsRunScreen', () => {
       totalEvents: 1,
     });
     runsHookMocks.events.mockReturnValue({ items: [event], nextCursor: null });
-    contextItemsMocks.getMany.mockImplementation(async () => [userContext]);
+    runsModuleMocks.llmContext.mockResolvedValue(buildLlmContextPage([{ contextItem: userContext }]));
 
     const queryClient = new QueryClient();
 
     render(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}`]}>
+        <MemoryRouter initialEntries={[`/threads/${event.threadId}/runs/${event.runId}?eventId=${event.id}`]}>
           <Routes>
             <Route path="/threads/:threadId/runs/:runId" element={<AgentsRunScreen />} />
           </Routes>
@@ -788,12 +815,23 @@ describe('AgentsRunScreen', () => {
       </QueryClientProvider>,
     );
 
-    await waitFor(() => expect(contextItemsMocks.getMany).toHaveBeenCalledWith([userContext.id]));
+    await waitFor(() =>
+      expect(runsModuleMocks.llmContext).toHaveBeenCalledWith(
+        event.runId,
+        event.id,
+        expect.objectContaining({ limit: 100 }),
+      ),
+    );
 
-    await waitFor(() => expect(runScreenMocks.props).toHaveBeenCalled());
-    const lastCall = runScreenMocks.props.mock.calls.at(-1);
-    const capturedProps = lastCall?.[0] as { events: Array<{ data: Record<string, unknown> }> } | undefined;
-    if (!capturedProps) throw new Error('RunScreen props were not captured.');
+    const capturedProps = await waitFor(() => {
+      const lastCall = runScreenMocks.props.mock.calls.at(-1);
+      const props = lastCall?.[0] as { events: Array<{ data: Record<string, unknown> }> } | undefined;
+      if (!props) throw new Error('RunScreen props were not captured.');
+      const [capturedEvent] = props.events;
+      const context = (capturedEvent.data.context as Record<string, unknown>[] | undefined) ?? [];
+      if (context.length === 0) throw new Error('Context not loaded yet.');
+      return props;
+    });
 
     const [capturedEvent] = capturedProps.events;
     const context = (capturedEvent.data.context as Record<string, unknown>[] | undefined) ?? [];
@@ -857,6 +895,7 @@ describe('AgentsRunScreen', () => {
           ],
           'ctx-highlight',
         ),
+        contextDeltaStatus: 'available',
         responseText: 'Working on it.',
         rawResponse: null,
         toolCalls: [],
@@ -884,7 +923,12 @@ describe('AgentsRunScreen', () => {
       totalEvents: 1,
     });
     runsHookMocks.events.mockReturnValue({ items: [event], nextCursor: null });
-    contextItemsMocks.getMany.mockImplementation(async () => [assistantContext, userContext]);
+    runsModuleMocks.llmContext.mockResolvedValue(
+      buildLlmContextPage([
+        { contextItem: assistantContext, isNew: false },
+        { contextItem: userContext, isNew: true },
+      ]),
+    );
 
     const queryClient = new QueryClient();
 
@@ -898,8 +942,7 @@ describe('AgentsRunScreen', () => {
       </QueryClientProvider>,
     );
 
-    await waitFor(() => expect(contextItemsMocks.getMany).toHaveBeenCalled());
-    expect(contextItemsMocks.getMany).toHaveBeenCalledWith(expect.arrayContaining([assistantContext.id, userContext.id]));
+    await waitFor(() => expect(runsModuleMocks.llmContext).toHaveBeenCalled());
 
     await waitFor(() => expect(runScreenMocks.props).toHaveBeenCalled());
     const lastCall = runScreenMocks.props.mock.calls.at(-1);
@@ -956,6 +999,7 @@ describe('AgentsRunScreen', () => {
           ],
           'ctx-llm-duplicate-new',
         ),
+        contextDeltaStatus: 'available',
         responseText: 'Report acknowledged.',
         rawResponse: null,
         toolCalls: [],
@@ -983,7 +1027,7 @@ describe('AgentsRunScreen', () => {
       totalEvents: 1,
     });
     runsHookMocks.events.mockReturnValue({ items: [event], nextCursor: null });
-    contextItemsMocks.getMany.mockResolvedValue([userContext]);
+    runsModuleMocks.llmContext.mockResolvedValue(buildLlmContextPage([{ contextItem: userContext, isNew: true }]));
 
     const queryClient = new QueryClient();
 
@@ -997,7 +1041,13 @@ describe('AgentsRunScreen', () => {
       </QueryClientProvider>,
     );
 
-    await waitFor(() => expect(contextItemsMocks.getMany).toHaveBeenCalledWith([userContext.id]));
+    await waitFor(() =>
+      expect(runsModuleMocks.llmContext).toHaveBeenCalledWith(
+        event.runId,
+        event.id,
+        expect.objectContaining({ limit: 100 }),
+      ),
+    );
 
     await waitFor(() => expect(runScreenMocks.props).toHaveBeenCalled());
     const lastCall = runScreenMocks.props.mock.calls.at(-1);
@@ -1059,6 +1109,7 @@ describe('AgentsRunScreen', () => {
           ],
           'ctx-assistant-tool',
         ),
+        contextDeltaStatus: 'available',
         responseText: null,
         rawResponse: null,
         toolCalls: [],
@@ -1086,7 +1137,12 @@ describe('AgentsRunScreen', () => {
       totalEvents: 1,
     });
     runsHookMocks.events.mockReturnValue({ items: [event], nextCursor: null });
-    contextItemsMocks.getMany.mockImplementation(async () => [assistantInput, toolInput]);
+    runsModuleMocks.llmContext.mockResolvedValue(
+      buildLlmContextPage([
+        { contextItem: assistantInput, isNew: true },
+        { contextItem: toolInput, isNew: true },
+      ]),
+    );
 
     const queryClient = new QueryClient();
 
@@ -1100,7 +1156,13 @@ describe('AgentsRunScreen', () => {
       </QueryClientProvider>,
     );
 
-    await waitFor(() => expect(contextItemsMocks.getMany).toHaveBeenCalledWith(expect.arrayContaining([assistantInput.id, toolInput.id])));
+    await waitFor(() =>
+      expect(runsModuleMocks.llmContext).toHaveBeenCalledWith(
+        event.runId,
+        event.id,
+        expect.objectContaining({ limit: 100 }),
+      ),
+    );
 
     await waitFor(() => expect(runScreenMocks.props).toHaveBeenCalled());
     const lastCall = runScreenMocks.props.mock.calls.at(-1);
@@ -1161,6 +1223,7 @@ describe('AgentsRunScreen', () => {
           ],
           'ctx-structured',
         ),
+        contextDeltaStatus: 'empty',
         responseText: null,
         rawResponse: null,
         toolCalls: [],
@@ -1189,7 +1252,7 @@ describe('AgentsRunScreen', () => {
       totalEvents: 1,
     });
     runsHookMocks.events.mockReturnValue({ items: [event], nextCursor: null });
-    contextItemsMocks.getMany.mockImplementation(async () => [assistantContext]);
+    runsModuleMocks.llmContext.mockResolvedValue(buildLlmContextPage([{ contextItem: assistantContext }]));
 
     const queryClient = new QueryClient();
 
@@ -1203,7 +1266,13 @@ describe('AgentsRunScreen', () => {
       </QueryClientProvider>,
     );
 
-    await waitFor(() => expect(contextItemsMocks.getMany).toHaveBeenCalledWith([assistantContext.id]));
+    await waitFor(() =>
+      expect(runsModuleMocks.llmContext).toHaveBeenCalledWith(
+        event.runId,
+        event.id,
+        expect.objectContaining({ limit: 100 }),
+      ),
+    );
 
     await waitFor(() => expect(runScreenMocks.props).toHaveBeenCalled());
     const lastCall = runScreenMocks.props.mock.calls.at(-1);
@@ -1274,6 +1343,7 @@ describe('AgentsRunScreen', () => {
           ],
           'ctx-per-item-tool-calls',
         ),
+        contextDeltaStatus: 'empty',
         responseText: 'All set.',
         rawResponse: null,
         toolCalls: [
@@ -1307,7 +1377,12 @@ describe('AgentsRunScreen', () => {
       totalEvents: 1,
     });
     runsHookMocks.events.mockReturnValue({ items: [event], nextCursor: null });
-    contextItemsMocks.getMany.mockImplementation(async () => [assistantWithTool, assistantWithoutTool]);
+    runsModuleMocks.llmContext.mockResolvedValue(
+      buildLlmContextPage([
+        { contextItem: assistantWithTool },
+        { contextItem: assistantWithoutTool },
+      ]),
+    );
 
     const queryClient = new QueryClient();
 
@@ -1322,7 +1397,11 @@ describe('AgentsRunScreen', () => {
     );
 
     await waitFor(() =>
-      expect(contextItemsMocks.getMany).toHaveBeenCalledWith(expect.arrayContaining([assistantWithTool.id, assistantWithoutTool.id])),
+      expect(runsModuleMocks.llmContext).toHaveBeenCalledWith(
+        event.runId,
+        event.id,
+        expect.objectContaining({ limit: 100 }),
+      ),
     );
 
     await waitFor(() => expect(runScreenMocks.props).toHaveBeenCalled());
@@ -1392,6 +1471,7 @@ describe('extractLlmResponse', () => {
         topP: null,
         stopReason: null,
         inputContextItems: [],
+        contextDeltaStatus: 'unavailable',
         responseText: null,
         rawResponse: null,
         toolCalls: [],
