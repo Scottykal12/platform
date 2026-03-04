@@ -1,6 +1,7 @@
 import { LLMContext, LLMContextState, LLMMessage, LLMState } from '../types';
 import { FunctionTool, Reducer, ResponseMessage, ToolCallMessage, ToolCallOutputMessage } from '@agyn/llm';
 import { Inject, Injectable, Logger, Scope } from '@nestjs/common';
+import { v4 as uuidv4 } from 'uuid';
 import { McpError } from '../../nodes/mcp/types';
 import { RunEventsService } from '../../events/run-events.service';
 import { EventsBusService } from '../../events/events-bus.service';
@@ -71,6 +72,74 @@ export class CallToolsLLMReducer extends Reducer<LLMState, LLMContext> {
       return { name: error.name, message: error.message, stack: error.stack };
     }
     return { message: String(error) };
+  }
+
+  private buildToolErrorDetails(error: unknown, errorCode: ToolCallErrorCode, errorId: string): Record<string, unknown> {
+    if (error instanceof McpError) {
+      return {
+        errorId,
+        name: error.name,
+        ...(error.code ? { code: error.code } : {}),
+        ...(typeof error.exitCode === 'number' && Number.isFinite(error.exitCode) ? { exitCode: error.exitCode } : {}),
+      };
+    }
+
+    if (error instanceof Error) {
+      return {
+        errorId,
+        name: error.name,
+      };
+    }
+
+    return {
+      errorId,
+      name: 'UnknownError',
+      ...(errorCode ? { code: errorCode } : {}),
+    };
+  }
+
+  private normalizeExecOutput(output?: string | null): string {
+    if (typeof output !== 'string') return '';
+    return output.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trimEnd();
+  }
+
+  private buildMcpFailureMessage(error: McpError, toolName: string): string {
+    const exitCode = typeof error.exitCode === 'number' && Number.isFinite(error.exitCode)
+      ? Number(error.exitCode)
+      : null;
+    const toolLabel = typeof toolName === 'string' && toolName.trim().length > 0 ? toolName.trim() : 'tool';
+    const header = exitCode !== null
+      ? `[exit code ${exitCode}] Process exited with code ${exitCode}`
+      : `[mcp_error] ${toolLabel} failed`;
+
+    const stderr = this.normalizeExecOutput(error.stderr ?? null);
+    const stdout = this.normalizeExecOutput(error.stdout ?? null);
+
+    let bodySegments: string[] = [];
+    const hasStderr = typeof stderr === 'string' && stderr.length > 0;
+    const hasStdout = typeof stdout === 'string' && stdout.length > 0;
+
+    if (hasStderr && hasStdout) {
+      if (stderr === stdout) {
+        bodySegments = [stderr];
+      } else {
+        bodySegments = [stderr, stdout];
+      }
+    } else if (hasStderr) {
+      bodySegments = [stderr];
+    } else if (hasStdout) {
+      bodySegments = [stdout];
+    }
+
+    if (bodySegments.length === 0) {
+      const fallbackLine = typeof error.message === 'string' && error.message.length > 0
+        ? error.message.split(/\r?\n/, 1)[0]?.trim()
+        : undefined;
+      bodySegments = [fallbackLine && fallbackLine.length > 0 ? fallbackLine : 'MCP tool failed'];
+    }
+
+    const body = bodySegments.join('\n');
+    return `${header}\n---\n${body}`;
   }
 
   private tools?: FunctionTool[];
@@ -326,23 +395,34 @@ export class CallToolsLLMReducer extends Reducer<LLMState, LLMContext> {
           };
         }
       } catch (err) {
+        const errorId = uuidv4();
         this.logger.error(
           `Error occurred while executing tool${this.format({
             tool: tool?.name ?? toolCall.name,
             callId: toolCall.callId,
+            errorId,
             error: this.errorInfo(err),
           })}`,
         );
-        const message = err instanceof Error && err.message ? err.message : 'Unknown error';
-        const details =
-          err instanceof Error ? { message: err.message, name: err.name, stack: err.stack } : { error: err };
         const code = err instanceof McpError ? 'MCP_CALL_ERROR' : 'TOOL_EXECUTION_ERROR';
-        response = createErrorResponse({
-          code,
-          message: `Tool ${toolCall.name} execution failed: ${message}`,
-          originalArgs: input,
-          details,
-        });
+        if (err instanceof McpError) {
+          const formatted = this.buildMcpFailureMessage(err, tool?.name ?? toolCall.name);
+          response = {
+            status: 'error',
+            raw: formatted,
+            output: formatted,
+          };
+        } else {
+          const baseMessage = err instanceof Error && err.message ? err.message : 'Unknown error';
+          const message = `Tool ${toolCall.name} execution failed: ${baseMessage}`;
+          const details = this.buildToolErrorDetails(err, code, errorId);
+          response = createErrorResponse({
+            code,
+            message,
+            originalArgs: input,
+            details,
+          });
+        }
       }
 
       if (!response) {

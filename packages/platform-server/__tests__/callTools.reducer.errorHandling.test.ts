@@ -10,6 +10,7 @@ import { CallAgentLinkingService } from '../src/agents/call-agent-linking.servic
 import { ShellCommandTool } from '../src/nodes/tools/shell_command/shell_command.tool';
 import { ManageFunctionTool } from '../src/nodes/tools/manage/manage.tool';
 import type { ManageToolNode } from '../src/nodes/tools/manage/manage.node';
+import { McpError } from '../src/nodes/mcp/types';
 
 const buildState = (name: string, callId: string, args: string) => {
   const response = new ResponseMessage({
@@ -109,7 +110,96 @@ describe('CallToolsLLMReducer error isolation', () => {
     const payload = parseErrorPayload(result);
     expect(payload.message).toContain('execution failed');
     expect(payload.error_code).toBe('TOOL_EXECUTION_ERROR');
-    expect(payload.details?.message).toBe('boom');
+    expect(payload.details).toMatchObject({
+      errorId: expect.any(String),
+      name: 'Error',
+    });
+    expect(payload.details.message).toBeUndefined();
+    expect(payload.details.stack).toBeUndefined();
+    expect(typeof payload.details.errorId).toBe('string');
+    expect(payload.details.errorId.length).toBeGreaterThan(0);
+  });
+
+  it('formats MCP error message with exit code and captured output', async () => {
+    const tool = {
+      name: 'mcp-failing',
+      description: 'throws McpError',
+      schema: z.object({}),
+      async execute() {
+        throw new McpError('Tool broke', {
+          code: 'TOOL_CALL_ERROR',
+          exitCode: 17,
+          stderr: 'fatal: something bad\nretry suggestion\n',
+          stdout: 'line one\nline two\n',
+        });
+      },
+    } as any;
+
+    const runEvents = createRunEventsStub();
+    const eventsBus = createEventsBusStub();
+    const reducer = new CallToolsLLMReducer(runEvents as any, eventsBus as any).init({ tools: [tool] });
+    const result = await reducer.invoke(buildState('mcp-failing', 'call-mcp-fail', JSON.stringify({})), ctx);
+
+    const last = result.messages.at(-1) as ToolCallOutputMessage;
+    expect(last).toBeInstanceOf(ToolCallOutputMessage);
+    const text = last.text;
+    expect(typeof text).toBe('string');
+    expect(text.startsWith('[exit code 17] Process exited with code 17')).toBe(true);
+    expect(text).toContain('\n---\n');
+    expect(text).toContain('Process exited with code 17');
+    expect(text).toContain('fatal: something bad');
+    expect(text).toContain('line one');
+    expect(text).toContain('line two');
+    expect(text).not.toContain('Tool broke');
+    expect(() => JSON.parse(text)).toThrow();
+  });
+
+  it('sanitizes MCP errors without exec output data', async () => {
+    const tool = {
+      name: 'mcp-minimal',
+      description: 'throws McpError without metadata',
+      schema: z.object({}),
+      async execute() {
+        throw new McpError('Tool broke', 'TOOL_CALL_ERROR');
+      },
+    } as any;
+
+    const runEvents = createRunEventsStub();
+    const eventsBus = createEventsBusStub();
+    const reducer = new CallToolsLLMReducer(runEvents as any, eventsBus as any).init({ tools: [tool] });
+    const result = await reducer.invoke(buildState('mcp-minimal', 'call-mcp-min', JSON.stringify({})), ctx);
+
+    const last = result.messages.at(-1) as ToolCallOutputMessage;
+    expect(last).toBeInstanceOf(ToolCallOutputMessage);
+    const text = last.text;
+    expect(typeof text).toBe('string');
+    expect(text).toBe('[mcp_error] mcp-minimal failed\n---\nTool broke');
+    expect(text).toContain('\n---\n');
+    expect(() => JSON.parse(text)).toThrow();
+  });
+
+  it('deduplicates identical MCP streams in body', async () => {
+    const tool = {
+      name: 'mcp-dup',
+      description: 'throws identical streams',
+      schema: z.object({}),
+      async execute() {
+        throw new McpError('Tool duplicate', {
+          stderr: 'same output\n',
+          stdout: 'same output\n',
+        });
+      },
+    } as any;
+
+    const runEvents = createRunEventsStub();
+    const eventsBus = createEventsBusStub();
+    const reducer = new CallToolsLLMReducer(runEvents as any, eventsBus as any).init({ tools: [tool] });
+    const result = await reducer.invoke(buildState('mcp-dup', 'call-dup', JSON.stringify({})), ctx);
+
+    const last = result.messages.at(-1) as ToolCallOutputMessage;
+    expect(last).toBeInstanceOf(ToolCallOutputMessage);
+    const text = last.text;
+    expect(text).toBe('[mcp_error] mcp-dup failed\n---\nsame output');
   });
 
   it('enforces TOOL_OUTPUT_TOO_LARGE limit', async () => {
